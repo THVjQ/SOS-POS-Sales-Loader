@@ -1,4 +1,4 @@
-# SOS POS Walk-in Sales Loader
+# SOS POS Sales Loader
 
 **Version:** 1.0 · **Site:** app.sospos.com.au
 
