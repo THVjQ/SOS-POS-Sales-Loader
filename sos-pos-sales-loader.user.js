@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -11,6 +11,8 @@
 
 (function () {
   'use strict';
+
+  const VERSION = '2.6';
 
   // ─────────────────────────────────────────────────────────────
   // NoteParser (inline)
@@ -187,6 +189,7 @@
       position: sticky; top: 0; z-index: 2;
     }
     #sost-header .sost-title { flex: 1; }
+    #sost-header .sost-ver { font-size: 11px; font-weight: 600; color: rgba(255,255,255,.7); margin-right: 4px; }
     #sost-close-btn {
       background: rgba(255,255,255,.2); border: none; color: #fff; width: 26px; height: 26px;
       border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; display: flex;
@@ -307,6 +310,7 @@
   panel.innerHTML = `
     <div id="sost-header">
       <span>🏷️</span><span class="sost-title">Sales Loader</span>
+      <span class="sost-ver">v${VERSION}</span>
       <button id="sost-close-btn" title="Close">✕</button>
     </div>
     <div id="sost-tabs">
