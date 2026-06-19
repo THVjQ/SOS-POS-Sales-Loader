@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.7
-// @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
+// @version      2.1
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -12,141 +12,191 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.7';
-
-  // Guard against double-injection (common when pulled in by a bootstrap/@require loader).
-  // Without this you'd get two panels sharing the same element IDs, which makes tab
-  // switching (Settings/Results) target the wrong, hidden copy and appear blank.
-  if (window.__sostLoaderActive || document.getElementById('sost-fab')) return;
-  window.__sostLoaderActive = true;
-
   // ─────────────────────────────────────────────────────────────
-  // NoteParser (inline)
-  // Extracts name / phone / email / item from messy repair notes.
-  // Walk-ins are intentionally excluded from parsing here.
+  // Parser — device + repair job extractor (v2 improved algorithm)
+  // Produces:  device label + job labels joined, narrative stripped.
+  // Walk-ins bypass this entirely (handled separately below).
   // ─────────────────────────────────────────────────────────────
-  const NoteParser = (() => {
-    const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
-    const PHONE_RUN_RE = /\d(?:[ \-(]?\d){6,12}/g;
-    const AREA = '02'; // default area code for bare 8-digit landlines
-
-    function normalisePhone(digits) {
-      if (/^61[2-8]\d{8}$/.test(digits)) digits = '0' + digits.slice(2);
-      if (digits.length === 9 && digits[0] === '4') digits = '0' + digits;
-      if (digits.length === 8 && /^[2-9]/.test(digits)) digits = AREA + digits;
-      if (digits.length !== 10 || digits[0] !== '0') return null;
-      if (digits[1] === '4') return digits.slice(0,4)+' '+digits.slice(4,7)+' '+digits.slice(7);
-      if ('235678'.includes(digits[1])) return '('+digits.slice(0,2)+') '+digits.slice(2,6)+' '+digits.slice(6);
-      return null;
+  const Parser = (() => {
+    // ── Phone ────────────────────────────────────────────────────
+    function findPhone(text) {
+      const cands = text.match(/(?:\+?61[\s-]?|0)?\d(?:[\s-]?\d){6,11}/g) || [];
+      const valid = [];
+      for (const c of cands) {
+        let d = c.replace(/[^\d]/g,'');
+        if (d.startsWith('61') && d.length >= 11) d = '0' + d.slice(2);
+        if (d.length === 9 && d[0] === '4') d = '0' + d;
+        if (d.length === 8) d = '02' + d;
+        const isMobile = /^04\d{8}$/.test(d);
+        const isLand   = /^0[2-9]\d{8}$/.test(d);
+        if (!isMobile && !isLand) continue;
+        valid.push({ pretty: prettyPhone(d), isMobile });
+      }
+      const mob = valid.find(v => v.isMobile);
+      return mob ? mob.pretty : (valid.length ? valid[0].pretty : 'X');
+    }
+    function prettyPhone(d) {
+      if (/^04\d{8}$/.test(d))   return d.replace(/(\d{4})(\d{3})(\d{3})/, '$1 $2 $3');
+      if (/^0[2-9]\d{8}$/.test(d)) return d.replace(/(\d{2})(\d{4})(\d{4})/, '($1) $2 $3');
+      return d;
     }
 
-    function extractPhones(text) {
-      const out = [], spans = [];
-      const re = new RegExp(PHONE_RUN_RE.source, 'g'); let m;
-      while ((m = re.exec(text))) {
-        const d = m[0].replace(/\D/g,''), pretty = normalisePhone(d);
-        if (pretty && !out.includes(pretty)) { out.push(pretty); spans.push([m.index, m.index+m[0].length]); }
-      }
-      return { phones: out, spans };
+    // ── Email ────────────────────────────────────────────────────
+    const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+    const firstEmail = t => { const m = t.match(EMAIL_RE); return m ? m[0].toLowerCase() : ''; };
+
+    // ── Device ───────────────────────────────────────────────────
+    const TIER  = '(pro max|pro|plus|max|mini|ultra|fe|\\+)';
+    const cap   = s => s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : '';
+    const upper = s => s ? s.toUpperCase().replace(/\s+/g,' ').trim() : '';
+    function tierSuffix(t) {
+      if (!t) return '';
+      const x = t.toLowerCase().trim();
+      return x === '+' ? ' Plus' : ' ' + x.split(/\s+/).map(cap).join(' ');
     }
 
     const DEVICE_PATTERNS = [
-      { re: /\b(?:i\s?ph(?:o|)n?s?e?)\s*(\d{1,2})\s*(pro\s*max|pro|plus|mini|pm)?/i,
-        label: m => 'iPhone '+m[1]+tier(m[2]) },
-      { re: /\b(\d{1,2})\s*(pro\s*max|pro\s*plus|pro|pm)\b/i,
-        label: m => 'iPhone '+m[1]+tier(m[2]) },
-      { re: /\boppo\s*([a-z]?\d{1,3})/i,        label: m => 'Oppo '+m[1].toUpperCase() },
-      { re: /\bpixel\s*(\d[a-z]?)/i,             label: m => 'Pixel '+m[1] },
-      { re: /\bmac\s?book(\s*(?:air|pro))?\s*(a\d{4})?/i,
-        label: m => 'MacBook'+(m[1]?cap(m[1]):'')+(m[2]?' '+m[2].toUpperCase():'') },
-      { re: /\bi\s?pad(\s*(?:pro|air|mini))?\s*(\d{0,2}(?:th|nd|st|rd)?\s*gen)?/i,
-        label: m => 'iPad'+(m[1]?cap(m[1]):'')+(m[2]?' '+m[2].trim():'') },
-      { re: /\bi\s?pod\b/i,                      label: () => 'iPod' },
-      { re: /\b(?:samsung\s*|galaxy\s*)?(s\d{1,2}(?!\d)|a\d{2}(?!\d)|z\s*(?:flip|fold)\s*\d?|note\s*\d{1,2})\s*(fe|ultra|plus|\+)?/i,
-        label: m => 'Samsung '+m[1].toUpperCase().replace(/\s+/g,' ')+tier(m[2]) },
-      { re: /\b(?:samsung\s*)?(flip|fold)\s*(\d?)/i,
-        label: m => 'Samsung '+cap(m[1])+(m[2]?' '+m[2]:'') },
+      { re: /\bipad\s*(pro|air|mini)?\s*(\d{1,2}\.\d|\d{1,2}\s*(?:"|inch))?\s*(\d{1,2})?(?:st|nd|rd|th)?\s*(?:gen)?\s*(a\d{4})?/i,
+        fmt: m => ('iPad '+(m[1]?cap(m[1])+' ':'')+
+                   (m[2]?m[2].trim()+' ':'')+
+                   (m[3]?m[3]+' ':'')+
+                   (m[4]?m[4].toUpperCase():'')).replace(/\s+/g,' ').trim() },
+      { re: /\bmacbook\s*(pro|air)?\s*(a\d{4})?/i,
+        fmt: m => 'MacBook'+(m[1]?' '+cap(m[1]):'')+( m[2]?' '+m[2].toUpperCase():'') },
+      { re: /\bipod\b/i, fmt: () => 'iPod' },
+      { re: new RegExp('\\biphone\\s*(\\d{1,2}s?|xs max|xs|xr|x|se\\s*\\d?|se)\\s*'+TIER+'?','i'),
+        fmt: m => 'iPhone '+upper(m[1])+tierSuffix(m[2]) },
+      { re: /\b(?:samsung\s+)?(?:galaxy\s+)?(s|note|tab)\s*(\d{1,3}[a-z]?)\s*(ultra|plus|fe|\+|pro)?/i,
+        fmt: m => 'Galaxy '+m[1].toUpperCase()+m[2].toUpperCase()+tierSuffix(m[3]) },
+      { re: /\b(?:samsung\s+)?(?:galaxy\s+)?a\s*(\d{2,3}[a-z]?)(?!\d)\s*(5g)?/i,
+        fmt: m => 'Galaxy A'+m[1].toUpperCase()+(m[2]?' 5G':'') },
+      { re: /\b(?:samsung\s+)?(?:galaxy\s+)?z\s*(flip|fold)\s*(\d)?/i,
+        fmt: m => 'Galaxy Z '+cap(m[1])+(m[2]?' '+m[2]:'') },
+      { re: /\bsamsung\s+(sm-?\w+)/i,          fmt: m => 'Samsung '+m[1].toUpperCase() },
+      { re: /\bpixel\s*(\d{1,2}\s*a?)\s*(pro xl|pro|xl|fold)?/i,
+        fmt: m => 'Pixel '+upper(m[1])+(m[2]?' '+m[2].split(/\s+/).map(cap).join(' '):'') },
+      { re: /\b(oppo)\s*([a-z]?\d{2,3}[a-z]*(?:\s*\d?g)?)/i,
+        fmt: m => 'Oppo '+m[2].toUpperCase().replace(/\s+/g,'') },
+      { re: /\b(?:moto|motorola)\s*(edge\s*\d+|g\d+\w*|\w+)/i,
+        fmt: m => 'Moto '+m[1].split(/\s+/).map(cap).join(' ') },
+      { re: /\bnothing\s*phone\s*(\w+)/i,      fmt: m => 'Nothing Phone '+m[1] },
+      { re: /\bhmd\s*(\w+\+?)/i,               fmt: m => 'HMD '+cap(m[1]) },
     ];
 
-    function tier(t) {
-      if (!t) return '';
-      t = t.toLowerCase().replace(/\s+/g,' ').trim();
-      return ({pm:' Pro Max','pro max':' Pro Max',pro:' Pro',plus:' Plus','+':' Plus',mini:' mini',fe:' FE',ultra:' Ultra'})[t]||' '+cap(t);
+    function detectDevice(text) {
+      let best = null;
+      DEVICE_PATTERNS.forEach(p => {
+        const m = text.match(p.re);
+        if (m && (best === null || m.index < best.index))
+          best = { device: p.fmt(m).replace(/\s+/g,' ').trim(), index: m.index };
+      });
+      return best || { device: '', index: -1 };
     }
-    function cap(s) { return s ? s[0].toUpperCase()+s.slice(1).toLowerCase() : ''; }
 
-    function detectAllDevices(text) {
-      const found = [];
-      for (const p of DEVICE_PATTERNS) {
-        const re = new RegExp(p.re.source,'gi'); let mm;
-        while ((mm = re.exec(text))) {
-          if (!mm[0].trim()) { re.lastIndex++; continue; }
-          found.push({ index: mm.index, end: mm.index+mm[0].length, label: p.label(mm).replace(/\s+/g,' ').trim() });
+    // ── Repair jobs ───────────────────────────────────────────────
+    const JOBS = [
+      [/charging?\s*port\s*clean|c\/?p\s*clean|port\s*clean/i,       'Charging Port Clean'],
+      [/charging?\s*port|charge\s*port|c\/?p\b/i,                    'Charging Port'],
+      [/rear\s*housing/i,                                             'Rear Housing'],
+      [/rear\s*glass|back\s*glass|b\/?g\b/i,                         'Rear Glass'],
+      [/camera\s*glass|cam\s*glass|cam(?:era)?\s*lens|lens\s*protector/i, 'Camera Glass'],
+      [/\bcamera\b|\bcam\b/i,                                         'Camera'],
+      [/housing|frame/i,                                              'Housing'],
+      [/\boled\b/i,                                                   'OLED'],
+      [/\blcd\b/i,                                                    'LCD'],
+      [/\bdigi(?:tizer)?\b/i,                                         'Digitizer'],
+      [/\bscreen\b|\bscre+ne?\b|\bsceen\b|screne/i,                  'Screen'],
+      [/amp\s*battery|battery\s*amp|\bbattery\b|\bbatt\b/i,          'Battery'],
+      [/data\s*transfer/i,                                            'Data Transfer'],
+      [/data\s*recover(?:y|ed)?/i,                                    'Data Recovery'],
+      [/virus\s*clean|scam\s*clean|\bvirus\b|\bscam\b/i,             'Virus Clean'],
+      [/factory\s*reset|\brestore\b/i,                                'Restore'],
+      [/ear\s*piece|earpiece|\bspeaker\b/i,                           'Speaker'],
+      [/power\s*button/i,                                             'Power Button'],
+      [/sim\s*tray/i,                                                 'Sim Tray'],
+      [/signal\s*flex/i,                                              'Signal Flex'],
+      [/microphone|\bmic\b/i,                                         'Microphone'],
+      [/\bwd\b|water\s*damaged?|liquid\s*damaged?/i,                  'Water Damage'],
+    ];
+
+    const NARRATIVE_CUTOFFS = /\b(call:|pin:|imei|cx\b|customer|opened? (?:the )?device|testing ok|tried|warned|quoted|happy to|will (?:be|drop|call|pick)|came (?:back|in)|did ?n.?t|was ?n.?t|does ?n.?t|is ?n.?t|no image|no touch|glitch|liquid damage indicators|no notes|paid|deposit|apple id|password|passcode|aware it)\b/i;
+
+    function detectJobsIn(segment) {
+      const raw = [];
+      for (const [re, label] of JOBS) {
+        const g = new RegExp(re.source,'gi'); let m;
+        while ((m = g.exec(segment)) !== null) {
+          raw.push({ label, index: m.index, len: m[0].length });
+          if (m.index === g.lastIndex) g.lastIndex++;
         }
       }
-      found.sort((a,b)=>a.index-b.index||(b.end-b.index)-(a.end-a.index));
-      const out = []; let last = -1;
-      for (const f of found) { if (f.index>=last) { out.push(f); last=f.end; } }
-      return out;
-    }
-
-    function splitByDevices(desc) {
-      const devs = detectAllDevices(desc);
-      if (devs.length <= 1) return [desc];
-      const segs = [];
-      for (let i=0; i<devs.length; i++) {
-        const start = i===0 ? 0 : devs[i].index;
-        const end   = i+1<devs.length ? devs[i+1].index : desc.length;
-        const seg   = desc.slice(start,end).replace(/^[\s\-–:,+]+|[\s\-–:,+]+$/g,'').trim();
-        if (seg) segs.push(seg);
+      raw.sort((a,b) => a.index-b.index || b.len-a.len);
+      const accepted = [];
+      for (const j of raw) {
+        if (accepted.some(a => j.index < a.index+a.len && a.index < j.index+j.len)) continue;
+        accepted.push(j);
       }
-      return segs.length ? segs : [desc];
+      const seen = new Set();
+      return accepted.filter(j => seen.has(j.label) ? false : seen.add(j.label)).map(j => j.label);
     }
 
-    const WALKIN_RE = /^\s*walk\s*[\-\s]?in\b|^\s*walkin\b/i;
-
-    function extractName(text, firstPhoneIdx) {
-      if (WALKIN_RE.test(text)) return 'Walk-in';
-      const dashIdx = text.search(/\s[-–]\s/);
-      const bounds = [dashIdx,firstPhoneIdx].filter(x=>x!==-1);
-      const cut = bounds.length ? Math.min(...bounds) : text.length;
-      const cand = text.slice(0,cut)
-        .replace(/\b(CALL|TEXT ONLY|TEXT|MOB|MOBILE|PH|PHONE|NAME)\b\s*:?/gi,'')
-        .replace(/[-–:,]+\s*$/,'').trim();
-      const words = cand.split(/\s+/).filter(Boolean);
-      if (cand.length > 40 || words.length > 5 || !cand) return '';
-      return cand;
+    function detectJobs(body) {
+      const cut  = body.search(NARRATIVE_CUTOFFS);
+      let head   = (cut > 0 ? body.slice(0,cut) : body).replace(/\s+and\s+/gi,' + ');
+      const primary = head.split(',')[0];
+      let jobs = detectJobsIn(primary);
+      if (!jobs.length) jobs = detectJobsIn(body);
+      if (jobs.length > 1) jobs = jobs.filter(j => j !== 'Water Damage');
+      if ((jobs.includes('OLED') || jobs.includes('LCD')) && jobs.includes('Screen'))
+        jobs = jobs.filter(j => j !== 'Screen');
+      return jobs;
     }
 
-    function tidy(s) {
-      return s.replace(/\(\s*\)/g,' ')
-        .replace(/\b(CALL|TEXT ONLY|TEXT|MOB|MOBILE|PH|PHONE)\b\s*:?/gi,' ')
-        .replace(/\s*[-–]\s*/g,' - ').replace(/(?:\s*-\s*){2,}/g,' - ')
-        .replace(/^[\s\-–:,]+|[\s\-–:,]+$/g,'').replace(/\s{2,}/g,' ').trim();
+    // ── Name ──────────────────────────────────────────────────────
+    const NAME_JUNK = /\b(call|text only|text|mob|ph|phone|cx|walkin|walk-in)\b[:.]?/gi;
+    function detectName(line) {
+      const dashIdx  = line.search(/\s*-\s*/);
+      const phoneM   = line.match(/(?:\+?61[\s-]?|0)?\d(?:[\s-]?\d){6,11}/);
+      const phoneIdx = phoneM ? line.indexOf(phoneM[0]) : -1;
+      let cut = line.length;
+      if (dashIdx  >= 0) cut = Math.min(cut, dashIdx);
+      if (phoneIdx >= 0) cut = Math.min(cut, phoneIdx);
+      let name = line.slice(0,cut)
+        .replace(NAME_JUNK,'')
+        .replace(/[-–—:\s]+$/,'')
+        .replace(/\s+/g,' ').trim();
+      return /^(walk\s*-?in)?$/i.test(name) ? 'Walk-in' : (name || 'Walk-in');
     }
 
-    function parseNote(raw) {
-      const note = String(raw??'').replace(/\s+/g,' ').trim();
-      if (!note) return [];
-      const emails = note.match(EMAIL_RE) || [];
-      const ph = extractPhones(note);
-      const firstPhoneIdx = ph.spans.length ? ph.spans[0][0] : -1;
-      const name  = extractName(note, firstPhoneIdx);
-      const phone = ph.phones[0] || '';
-      const email = emails[0] || '';
+    // ── Main ──────────────────────────────────────────────────────
+    function parseNote(rawLine) {
+      const line  = String(rawLine).replace(/\s+/g,' ').trim();
+      const name  = detectName(line);
+      const phone = findPhone(line);
+      const email = firstEmail(line);
 
-      let desc = note;
-      emails.forEach(e => { desc = desc.split(e).join(' '); });
-      const reRun = new RegExp(PHONE_RUN_RE.source,'g'); let pm; const runs=[];
-      while ((pm = reRun.exec(note))) { if (normalisePhone(pm[0].replace(/\D/g,''))) runs.push(pm[0]); }
-      runs.forEach(r => { desc = desc.split(r).join(' '); });
-      if (name && name !== 'Walk-in') desc = desc.replace(new RegExp('^\\s*'+name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'i'),'');
-      else if (name === 'Walk-in') desc = desc.replace(WALKIN_RE,'');
-      desc = tidy(desc);
-      return splitByDevices(desc).map(seg => ({ name, phone, email, item: tidy(seg), raw: note }));
+      let body = line.replace(/^\s*walk\s*-?in\b[\s:-]*/i,' ');
+      if (name && name !== 'Walk-in') body = body.replace(name,' ');
+      body = body
+        .replace(/(?:\+?61[\s-]?|0)?\d(?:[\s-]?\d){6,11}/g,' ')
+        .replace(EMAIL_RE,' ')
+        .replace(/\$\s*\d+(?:\.\d+)?/g,' ')
+        .replace(/\bpin:?\s*\d+/gi,' ')
+        .replace(/\s+/g,' ').trim();
+
+      const { device } = detectDevice(body);
+      const jobs = detectJobs(body);
+
+      let item;
+      if (device && jobs.length)  item = device + ' ' + jobs.join(' + ');
+      else if (device)            item = device;
+      else if (jobs.length)       item = jobs.join(' + ');
+      else                        item = body.replace(/^[-–—\s]+|[-–—\s]+$/g,'') || '(see note)';
+
+      return { name, phone, email, item: item.replace(/\s+/g,' ').trim(), device, jobs, raw: rawLine.trim() };
     }
 
-    return { parseNote, parseNotes: arr=>(arr||[]).flatMap(n=>parseNote(n)) };
+    return { parseNote };
   })();
 
   // ─────────────────────────────────────────────────────────────
@@ -157,25 +207,9 @@
   // ─────────────────────────────────────────────────────────────
   // Settings
   // ─────────────────────────────────────────────────────────────
-  const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto', waitAfterEach: true, useNoteParser: true };
-  // Use GM storage when available; fall back to localStorage if the loader didn't pass the grants through.
-  function gmGet(key, def) {
-    try { if (typeof GM_getValue === 'function') return GM_getValue(key, def); } catch {}
-    try { const v = localStorage.getItem(key); return v == null ? def : v; } catch { return def; }
-  }
-  function gmSet(key, val) {
-    try { if (typeof GM_setValue === 'function') { GM_setValue(key, val); return; } } catch {}
-    try { localStorage.setItem(key, val); } catch {}
-  }
-  function loadCfg() {
-    let saved = {};
-    try { saved = JSON.parse(gmGet('sost_cfg','{}')) || {}; } catch { saved = {}; }
-    // migrate old payMode values from v2.1 and earlier
-    if (saved.payMode === 'auto1')   { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = true; }
-    if (saved.payMode === 'autoall') { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = false; }
-    return Object.assign({}, DEFAULTS, saved);
-  }
-  function saveCfg(c) { gmSet('sost_cfg', JSON.stringify(c)); }
+  const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto1', useNoteParser: true };
+  function loadCfg() { try { return Object.assign({},DEFAULTS,JSON.parse(GM_getValue('sost_cfg','{}'))); } catch { return Object.assign({},DEFAULTS); } }
+  function saveCfg(c) { GM_setValue('sost_cfg',JSON.stringify(c)); }
   let cfg = loadCfg();
 
   // ─────────────────────────────────────────────────────────────
@@ -184,35 +218,31 @@
   const style = document.createElement('style');
   style.textContent = `
     #sost-fab {
-      position: fixed; bottom: 20px; left: 20px; width: 44px; height: 44px;
+      position: fixed; bottom: 20px; left: 224px; width: 44px; height: 44px;
       border-radius: 50%; background: #0d9488; box-shadow: 0 3px 14px rgba(13,148,136,.55);
-      border: none; cursor: pointer; z-index: 2147483647; display: flex; align-items: center;
+      border: none; cursor: pointer; z-index: 99999; display: flex; align-items: center;
       justify-content: center; font-size: 20px; transition: background .15s; user-select: none;
     }
     #sost-fab:hover { background: #0f766e; }
     #sost-panel {
       position: fixed; bottom: 72px; left: 20px; width: 420px; background: #0f172a;
       color: #e2e8f0; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.7);
-      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 2147483646;
-      border: 1px solid #1e293b; display: none;
-      max-height: calc(100vh - 90px); overflow-y: auto;
+      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 99998;
+      border: 1px solid #1e293b; display: none; overflow: hidden;
     }
     #sost-panel.open { display: block; }
     #sost-header {
       background: linear-gradient(135deg,#14b8a6 0%,#0d9488 100%); padding: 14px 16px;
       font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px;
-      position: sticky; top: 0; z-index: 2;
     }
     #sost-header .sost-title { flex: 1; }
-    #sost-header .sost-ver { font-size: 11px; font-weight: 600; color: rgba(255,255,255,.7); margin-right: 4px; }
     #sost-close-btn {
       background: rgba(255,255,255,.2); border: none; color: #fff; width: 26px; height: 26px;
       border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; display: flex;
       align-items: center; justify-content: center;
     }
     #sost-close-btn:hover { background: rgba(255,255,255,.35); }
-    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b;
-      position: sticky; top: 47px; z-index: 2; }
+    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; }
     .sost-tab { flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 600;
       cursor: pointer; color: #64748b; border-bottom: 2px solid transparent; user-select: none; }
     .sost-tab.active { color: #14b8a6; border-bottom-color: #14b8a6; }
@@ -294,29 +324,16 @@
     #sost-results-table input { width: 78px; background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
       border-radius: 6px; padding: 4px 6px; font-size: 12px; }
     .sost-res-name { color: #cbd5e1; }
-    .sost-res-row.sost-res-existing .sost-res-name { color: #fcd34d; }
-    .sost-res-row.sost-res-pending  .sost-res-name { color: #c4b5fd; }
-    .sost-res-copy { padding: 3px 9px !important; font-size: 12px !important; }
     #sost-results-empty { color: #475569; font-size: 12px; text-align: center; padding: 16px 0; }
   `;
-  (document.head || document.documentElement).appendChild(style);
+  document.head.appendChild(style);
 
   // ─────────────────────────────────────────────────────────────
   // FAB + panel
   // ─────────────────────────────────────────────────────────────
   const fab = document.createElement('button');
   fab.id = 'sost-fab'; fab.title = 'SOS POS Sales Loader'; fab.innerHTML = '🏷️';
-
-  function mountFab() {
-    if (document.body && !document.body.contains(fab)) document.body.appendChild(fab);
-  }
-  mountFab();
-
-  // Re-mount if the SPA ever removes the button on a re-render / route change
-  if (document.body) {
-    new MutationObserver(mountFab).observe(document.body, { childList: true });
-  }
-
+  document.body.appendChild(fab);
   [400, 1200, 2500, 4500].forEach(t => setTimeout(positionFab, t));
   window.addEventListener('resize', () => setTimeout(positionFab, 100));
 
@@ -325,7 +342,6 @@
   panel.innerHTML = `
     <div id="sost-header">
       <span>🏷️</span><span class="sost-title">Sales Loader</span>
-      <span class="sost-ver">v${VERSION}</span>
       <button id="sost-close-btn" title="Close">✕</button>
     </div>
     <div id="sost-tabs">
@@ -336,10 +352,6 @@
 
     <!-- BUILD -->
     <div class="sost-pane active" id="tab-build">
-      <div style="display:flex;align-items:center;margin-bottom:8px">
-        <span class="sost-label" style="margin:0;flex:1">Paste &amp; build</span>
-        <button class="sost-btn sost-btn-muted sost-btn-sm" id="sost-clear-top">Clear all</button>
-      </div>
       <div id="sost-drop-zone" tabindex="0" title="Click then Ctrl+V to paste">
         <textarea id="sost-paste" tabindex="-1" aria-hidden="true"></textarea>
         <div class="dz-icon">📋</div>
@@ -363,7 +375,7 @@
     <div class="sost-pane" id="tab-results">
       <div id="sost-results-empty">No tickets captured yet.</div>
       <table id="sost-results-table" style="display:none">
-        <thead><tr><th>Ticket #</th><th>Name</th><th></th></tr></thead>
+        <thead><tr><th>Ticket #</th><th>Name</th></tr></thead>
         <tbody id="sost-results-body"></tbody>
       </table>
       <div class="sost-btn-row" id="sost-results-actions" style="display:none">
@@ -379,14 +391,8 @@
         <label class="sost-label">Payment</label>
         <select class="sost-select" id="sost-pay-mode">
           <option value="manual">Stop at Checkout — I take payment</option>
-          <option value="auto">Auto-pay each ticket</option>
-        </select>
-      </div>
-      <div class="sost-field">
-        <label class="sost-label">After each ticket</label>
-        <select class="sost-select" id="sost-wait-each">
-          <option value="yes">Pause — wait before the next one</option>
-          <option value="no">Don't wait — run them all in a row</option>
+          <option value="auto1">Auto-pay each, pause between (recommended)</option>
+          <option value="autoall">Auto-pay — run everything</option>
         </select>
       </div>
       <div class="sost-field">
@@ -428,17 +434,16 @@
       </p>
     </div>
   `;
-  (document.body || document.documentElement).appendChild(panel);
+  document.body.appendChild(panel);
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
   document.getElementById('sost-close-btn').addEventListener('click', () => panel.classList.remove('open'));
-  panel.querySelectorAll('.sost-tab').forEach(tab => {
+  document.querySelectorAll('.sost-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      panel.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
-      panel.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
       tab.classList.add('active');
-      const pane = panel.querySelector('#tab-' + tab.dataset.tab);
-      if (pane) pane.classList.add('active');
+      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     });
   });
 
@@ -447,18 +452,15 @@
   const $delay = document.getElementById('sost-step-delay');
   const $strip = document.getElementById('sost-strip');
   const $pay   = document.getElementById('sost-pay-mode');
-  const $waitEach = document.getElementById('sost-wait-each');
   const $noteParser = document.getElementById('sost-note-parser');
   $price.value = cfg.priceMode; $delay.value = cfg.stepDelay;
   $strip.value = cfg.stripWalkin ? 'yes' : 'no'; $pay.value = cfg.payMode;
-  $waitEach.value = cfg.waitAfterEach ? 'yes' : 'no';
   $noteParser.value = cfg.useNoteParser ? 'yes' : 'no';
   document.getElementById('sost-save-cfg').addEventListener('click', () => {
     cfg.priceMode = $price.value;
     cfg.stepDelay = Math.max(100, parseInt($delay.value,10) || DEFAULTS.stepDelay);
     cfg.stripWalkin  = $strip.value === 'yes';
     cfg.payMode      = $pay.value;
-    cfg.waitAfterEach = $waitEach.value === 'yes';
     cfg.useNoteParser = $noteParser.value === 'yes';
     saveCfg(cfg); setStatus('✓ Settings saved.');
     if (rawCache) doParse(rawCache);
@@ -467,7 +469,8 @@
   // ─────────────────────────────────────────────────────────────
   // State
   // ─────────────────────────────────────────────────────────────
-  let jobs = [], builtIdx = -1, rawCache = '', results = [], existingRows = [];
+  let jobs = [], builtIdx = -1, rawCache = '', results = [];
+  const captured = new Set();
 
   const dropZone = document.getElementById('sost-drop-zone');
   const pasteArea = document.getElementById('sost-paste');
@@ -478,7 +481,6 @@
     pasteArea.value = raw; setTimeout(() => doParse(raw), 40);
   });
   document.getElementById('sost-dz-clear').addEventListener('click', clearAll);
-  document.getElementById('sost-clear-top').addEventListener('click', clearAll);
 
   // ─────────────────────────────────────────────────────────────
   // Parse helpers
@@ -505,36 +507,26 @@
     return /^[A-Z]\d{3,}/.test((ticket||'').trim());
   }
 
-  // Resolve description using NoteParser (when on) or a simple split fallback
+  // Resolve description via Parser (when on) or simple split fallback.
   // Returns { name, phone, email, item, needsManual }
+  // needsManual = true when the parser could not produce a clean item, or
+  // when the note contains sensitive data (passwords) that must not go into SOSPOS.
   function resolveDesc(rawDesc) {
     if (!cfg.useNoteParser) {
-      // Fallback: split on first phone-like pattern
       const ph = rawDesc.match(/0[\d\s-]{7,}/);
       if (ph) {
-        const idx = rawDesc.indexOf(ph[0]);
-        const name  = rawDesc.slice(0, idx).replace(/[-–\s]+$/,'').trim();
-        const after = rawDesc.slice(idx + ph[0].length).replace(/^\s*[-–:]\s*/,'').trim();
+        const idx   = rawDesc.indexOf(ph[0]);
+        const name  = rawDesc.slice(0,idx).replace(/[-–\s]+$/,'').trim();
+        const after = rawDesc.slice(idx+ph[0].length).replace(/^\s*[-–:]\s*/,'').trim();
         return { name: name||'', phone: ph[0].trim(), email: '', item: after||rawDesc, needsManual: false };
       }
       return { name: '', phone: 'X', email: '', item: rawDesc, needsManual: false };
     }
 
-    const results = NoteParser.parseNote(rawDesc);
-    if (!results || !results.length) return { name: '', phone: 'X', email: '', item: '', needsManual: true };
-
-    const r = results[0];
+    const r = Parser.parseNote(rawDesc);
     const item = r.item || '';
-
-    // Flag as needing manual review:
-    // - no item text
-    // - contains a password (security)
-    // - very long with no device found
-    const hasDevice = /\biphone|samsung|oppo|pixel|ipad|macbook|ipod|flip|fold\b/i.test(item);
-    const needsManual = !item ||
-      /password[\s:]/i.test(rawDesc) ||
-      (item.length > 150 && !hasDevice);
-
+    // Flag for manual review: unresolvable item OR note contains credentials
+    const needsManual = !item || item === '(see note)' || /password[\s:]/i.test(rawDesc);
     return { name: r.name||'', phone: r.phone||'X', email: r.email||'', item, needsManual };
   }
 
@@ -561,8 +553,7 @@
 
       // Skip rows that already have a real ticket number
       if (isExistingTicket(ticket)) {
-        const exName = isWalkin(desc) ? 'Walk-in' : (resolveDesc(desc).name || '');
-        existingList.push({ ticket, desc, name: exName });
+        existingList.push({ ticket, desc });
         continue;
       }
 
@@ -605,10 +596,7 @@
     const walk    = Array.from(walkMap.values());
     const manual  = Array.from(manualMap.values());
     jobs = [...named, ...walk, ...manual];
-    existingRows = existingList;
-    results = [];
-    builtIdx = -1;
-    renderResults();
+    builtIdx = -1; captured.clear();
     renderPreview(named.length, walk.length, manual.length, existingList);
 
     const buildable = named.length + walk.length + manual.length;
@@ -712,7 +700,7 @@
   function esc(s) { return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
   function clearAll() {
-    jobs=[]; builtIdx=-1; rawCache=''; existingRows=[]; results=[];
+    jobs=[]; builtIdx=-1; rawCache=''; captured.clear();
     pasteArea.value='';
     document.getElementById('sost-preview').innerHTML='';
     document.getElementById('sost-build-btn').style.display='none';
@@ -721,7 +709,6 @@
     dropZone.classList.remove('has-data');
     document.getElementById('sost-paste-summary').style.display='none';
     setStatus('');
-    renderResults();
   }
 
   function setStatus(m) { document.getElementById('sost-status').textContent = m; }
@@ -740,11 +727,9 @@
 
   async function onBuildClick() {
     buildBtn.disabled = true;
-    const autoPay = cfg.payMode === 'auto';
-    // Auto-pay with no waiting → run the whole lot in one go
-    if (autoPay && !cfg.waitAfterEach) { await runAll(); return; }
-    // Manual payment: capture the ticket the user just checked out
-    if (!autoPay && builtIdx >= 0) captureResult(builtIdx);
+    const mode = cfg.payMode;
+    if (mode === 'autoall') { await runAll(); return; }
+    if (mode === 'manual' && builtIdx >= 0) captureResult(builtIdx);
 
     // Find next buildable job (skip manual with no description)
     let toBuild = builtIdx + 1;
@@ -758,23 +743,23 @@
     setStatus(`Building ${labelOf(jobs[toBuild])}…`);
     try {
       await buildJob(jobs[toBuild]);
-      if (autoPay) { await payAndComplete(jobs[toBuild]); captureResult(toBuild); }
+      if (mode === 'auto1') { await payAndComplete(jobs[toBuild]); captureResult(toBuild); }
       setJobStatus(toBuild, 'done'); builtIdx = toBuild; setProgress();
-      updateStepButton(autoPay);
+      updateStepButton(mode);
     } catch (e) {
       setJobStatus(toBuild, 'pending'); buildBtn.disabled = false;
       setStatus('✕ ' + e.message); console.error('[SOS Loader]', e);
     }
   }
 
-  function updateStepButton(autoPay) {
+  function updateStepButton(mode) {
     buildBtn.disabled = false;
     // Find the next buildable job index
     let next = builtIdx + 1;
     while (next < jobs.length && jobs[next].type === 'manual' && !jobs[next].manualDesc.trim()) next++;
     const remaining = next < jobs.length;
     const totalNum  = builtIdx + 2;
-    if (autoPay) {
+    if (mode === 'auto1') {
       if (remaining) { buildBtn.textContent=`▶ Next (${totalNum}/${jobs.length})`; setStatus(`✓ Paid "${labelOf(jobs[builtIdx])}". Click for next.`); }
       else finishAll();
     } else {
@@ -801,19 +786,17 @@
   }
 
   function finishAll() {
-    finalizeResults();
     const skippedManual = jobs.filter(j=>j.type==='manual'&&j.status!=='done').length;
     buildBtn.textContent = skippedManual ? `✓ Done — fill ${skippedManual} manual item${skippedManual>1?'s':''} then ▶` : '✓ All done';
     buildBtn.disabled = skippedManual === 0;
-    if (skippedManual) { buildBtn.disabled = false; setStatus(`🎉 Built what it could. The ${skippedManual} skipped item(s) are listed in Results as blanks — fill them above & click ▶, or just type their ticket #s in Results.`); }
-    else { setStatus(`🎉 Finished — ${results.length} row${results.length!==1?'s':''} in Results.`); switchTab('results'); }
+    if (skippedManual) { buildBtn.disabled = false; setStatus(`🎉 Auto-built done. Fill in the ${skippedManual} purple items above, then click ▶ again.`); }
+    else { setStatus(`🎉 Finished — ${results.length} ticket${results.length!==1?'s':''} captured. See Results.`); switchTab('results'); }
   }
 
   // ─────────────────────────────────────────────────────────────
   // Build a single job (named, walk-in, or manual)
   // ─────────────────────────────────────────────────────────────
   async function buildJob(job) {
-    if (findReceiptDialog()) await dismissReceiptDialog(1500);
     const saleTab = findTab('Sale');
     if (saleTab) { saleTab.click(); await sleep(cfg.stepDelay); }
 
@@ -870,29 +853,7 @@
     if (completeBtn.disabled) throw new Error('Complete Payment stayed disabled — modal left open for you');
     completeBtn.click();
     await waitFor(()=>!findCheckoutDialog(), 6000);
-    await dismissReceiptDialog(5000);
     await sleep(cfg.stepDelay+400);
-  }
-
-  // SOSPOS shows a "Would you like a receipt?" dialog after payment — click Skip
-  function findReceiptDialog() {
-    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
-      const h = d.querySelector('h2');
-      return h && /would you like a receipt/i.test(h.textContent);
-    });
-  }
-  async function dismissReceiptDialog(timeout=4000) {
-    const dlg = await waitFor(findReceiptDialog, timeout);
-    if (!dlg) return false;
-    await sleep(120);
-    const skip = Array.from(dlg.querySelectorAll('button')).find(b => /^\s*skip\s*$/i.test(b.textContent.trim()));
-    if (skip && !skip.disabled) {
-      skip.click();
-      await waitFor(() => !findReceiptDialog(), 3000);
-      await sleep(cfg.stepDelay);
-      return true;
-    }
-    return false;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -948,22 +909,23 @@
 
   async function handleDupDialog(dialog, phone) {
     await sleep(200);
-    const btns         = Array.from(dialog.querySelectorAll('button'));
-    const skipBtn      = btns.find(b => /skip this customer/i.test(b.textContent));
-    const useButtons   = btns.filter(b => /use this customer/i.test(b.textContent));
-    const createAnyway = btns.find(b  => /create new anyway/i.test(b.textContent));
+    const useButtons    = Array.from(dialog.querySelectorAll('button')).filter(b => /use this customer/i.test(b.textContent));
+    const createAnyway  = Array.from(dialog.querySelectorAll('button')).find(b  => /create new anyway/i.test(b.textContent));
 
-    if (skipBtn && !skipBtn.disabled) {
-      // Preferred: skip this customer and keep moving
-      skipBtn.click();
-    } else if ((!phone || phone === 'X') && createAnyway && !createAnyway.disabled) {
-      // No real phone and nothing to skip — create new
-      createAnyway.click();
-    } else if (useButtons.length >= 1) {
-      // One or more matches — take the first automatically (never pause)
-      (useButtons.find(b => !b.disabled) || useButtons[0]).click();
-    } else if (createAnyway && !createAnyway.disabled) {
-      createAnyway.click();
+    if (!phone || phone === 'X') {
+      // No real phone — create new
+      if (createAnyway && !createAnyway.disabled) createAnyway.click();
+    } else if (useButtons.length === 1) {
+      // Exactly one match — use it automatically
+      useButtons[0].click();
+    } else if (useButtons.length > 1) {
+      // Multiple matches — pause and let user pick
+      setStatus('⚠️ Multiple customers found — please select one in the dialog.');
+      buildBtn.disabled = false;
+      await waitFor(() => !document.querySelector('[role="dialog"]'), 120000, 500);
+    } else {
+      // No use-this button — just create new
+      if (createAnyway && !createAnyway.disabled) createAnyway.click();
     }
     await sleep(cfg.stepDelay);
   }
@@ -971,28 +933,12 @@
   // ─────────────────────────────────────────────────────────────
   // Results
   // ─────────────────────────────────────────────────────────────
-  function nameOf(job) {
-    return job.type === 'walkin' ? 'Walk-in' : (job.customer ? job.customer.name : 'Walk-in');
-  }
-
-  function upsertResult(id, ticket, name, status) {
-    const r = results.find(x => x.id === id);
-    if (r) { if (ticket && !r.ticket) r.ticket = ticket; r.name = name; r.status = status; }
-    else results.push({ id, ticket: ticket || '', name, status });
-  }
-
   function captureResult(i) {
-    const job = jobs[i];
-    if (!job) return;
-    job.capturedTicket = job.capturedTicket || latestTicket();
-    upsertResult('J' + i, job.capturedTicket, nameOf(job), 'done');
-    renderResults();
-  }
-
-  // Put EVERY row in the pile — built, skipped, and existing-ticket rows
-  function finalizeResults() {
-    jobs.forEach((job, i) => upsertResult('J' + i, job.capturedTicket || '', nameOf(job), job.status));
-    existingRows.forEach((ex, j) => upsertResult('E' + j, ex.ticket, ex.name || '—', 'existing'));
+    if (captured.has(i)) return;
+    captured.add(i);
+    const job  = jobs[i];
+    const name = job.type==='named'||job.type==='manual' ? job.customer.name : 'Walk-in';
+    results.push({ ticket: latestTicket(), name });
     renderResults();
   }
 
@@ -1017,19 +963,9 @@
     if (!results.length) { table.style.display='none'; actions.style.display='none'; empty.style.display='block'; return; }
     empty.style.display='none'; table.style.display='table'; actions.style.display='flex';
     body.innerHTML = results.map((r,i) => `
-      <tr class="sost-res-row sost-res-${r.status||''}">
-        <td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
-        <td class="sost-res-name">${esc(r.name)}</td>
-        <td style="text-align:right"><button class="sost-btn sost-btn-muted sost-btn-sm sost-res-copy" data-i="${i}" title="Copy this ticket #">⧉</button></td>
-      </tr>`).join('');
+      <tr><td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
+      <td class="sost-res-name">${esc(r.name)}</td></tr>`).join('');
     body.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => { results[Number(inp.dataset.i)].ticket = inp.value; }));
-    body.querySelectorAll('.sost-res-copy').forEach(btn => btn.addEventListener('click', () => {
-      const r = results[Number(btn.dataset.i)];
-      navigator.clipboard.writeText(r.ticket || '').then(
-        () => { const o=btn.textContent; btn.textContent='✓'; setTimeout(()=>btn.textContent=o,1000); },
-        () => alert('Copy failed: '+(r.ticket||'(empty)'))
-      );
-    }));
   }
 
   document.getElementById('sost-copy-btn').addEventListener('click', () => {
@@ -1039,11 +975,11 @@
       () => alert('Copy failed:\n\n'+tsv)
     );
   });
-  document.getElementById('sost-results-clear').addEventListener('click', () => { results=[]; renderResults(); });
+  document.getElementById('sost-results-clear').addEventListener('click', () => { results=[]; captured.clear(); renderResults(); });
 
   function switchTab(name) {
-    panel.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-    panel.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+name));
+    document.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+    document.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+name));
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1085,10 +1021,8 @@
 
   // ─────────────────────────────────────────────────────────────
   // Position FAB next to app's own bottom-left buttons
-  // (falls back to a clear bottom-left corner if no anchor is found)
   // ─────────────────────────────────────────────────────────────
   function positionFab() {
-    mountFab(); // make sure it's still in the DOM before measuring
     let best=null, bestRight=-1;
     document.querySelectorAll('button,a,div,[role="button"]').forEach(el=>{
       if (el.id&&(el.id.startsWith('sost')||el.id.startsWith('sosw'))) return;
@@ -1101,7 +1035,7 @@
       if (r.right>bestRight) { bestRight=r.right; best=r; }
     });
     if (best&&bestRight<=400) { fab.style.left=Math.round(bestRight+12)+'px'; fab.style.bottom=Math.round(window.innerHeight-best.bottom)+'px'; }
-    else { fab.style.left='20px'; fab.style.bottom='20px'; }
+    else { fab.style.left='224px'; fab.style.bottom='20px'; }
   }
 
 })();
