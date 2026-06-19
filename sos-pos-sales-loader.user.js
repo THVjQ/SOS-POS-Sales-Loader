@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -793,6 +793,7 @@
   // Build a single job (named, walk-in, or manual)
   // ─────────────────────────────────────────────────────────────
   async function buildJob(job) {
+    if (findReceiptDialog()) await dismissReceiptDialog(1500);
     const saleTab = findTab('Sale');
     if (saleTab) { saleTab.click(); await sleep(cfg.stepDelay); }
 
@@ -849,7 +850,29 @@
     if (completeBtn.disabled) throw new Error('Complete Payment stayed disabled — modal left open for you');
     completeBtn.click();
     await waitFor(()=>!findCheckoutDialog(), 6000);
+    await dismissReceiptDialog(5000);
     await sleep(cfg.stepDelay+400);
+  }
+
+  // SOSPOS shows a "Would you like a receipt?" dialog after payment — click Skip
+  function findReceiptDialog() {
+    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
+      const h = d.querySelector('h2');
+      return h && /would you like a receipt/i.test(h.textContent);
+    });
+  }
+  async function dismissReceiptDialog(timeout=4000) {
+    const dlg = await waitFor(findReceiptDialog, timeout);
+    if (!dlg) return false;
+    await sleep(120);
+    const skip = Array.from(dlg.querySelectorAll('button')).find(b => /^\s*skip\s*$/i.test(b.textContent.trim()));
+    if (skip && !skip.disabled) {
+      skip.click();
+      await waitFor(() => !findReceiptDialog(), 3000);
+      await sleep(cfg.stepDelay);
+      return true;
+    }
+    return false;
   }
 
   // ─────────────────────────────────────────────────────────────
