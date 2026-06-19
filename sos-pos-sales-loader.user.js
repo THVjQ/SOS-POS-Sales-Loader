@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -12,7 +12,13 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.6';
+  const VERSION = '2.7';
+
+  // Guard against double-injection (common when pulled in by a bootstrap/@require loader).
+  // Without this you'd get two panels sharing the same element IDs, which makes tab
+  // switching (Settings/Results) target the wrong, hidden copy and appear blank.
+  if (window.__sostLoaderActive || document.getElementById('sost-fab')) return;
+  window.__sostLoaderActive = true;
 
   // ─────────────────────────────────────────────────────────────
   // NoteParser (inline)
@@ -152,15 +158,24 @@
   // Settings
   // ─────────────────────────────────────────────────────────────
   const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto', waitAfterEach: true, useNoteParser: true };
+  // Use GM storage when available; fall back to localStorage if the loader didn't pass the grants through.
+  function gmGet(key, def) {
+    try { if (typeof GM_getValue === 'function') return GM_getValue(key, def); } catch {}
+    try { const v = localStorage.getItem(key); return v == null ? def : v; } catch { return def; }
+  }
+  function gmSet(key, val) {
+    try { if (typeof GM_setValue === 'function') { GM_setValue(key, val); return; } } catch {}
+    try { localStorage.setItem(key, val); } catch {}
+  }
   function loadCfg() {
     let saved = {};
-    try { saved = JSON.parse(GM_getValue('sost_cfg','{}')) || {}; } catch { saved = {}; }
+    try { saved = JSON.parse(gmGet('sost_cfg','{}')) || {}; } catch { saved = {}; }
     // migrate old payMode values from v2.1 and earlier
     if (saved.payMode === 'auto1')   { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = true; }
     if (saved.payMode === 'autoall') { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = false; }
     return Object.assign({}, DEFAULTS, saved);
   }
-  function saveCfg(c) { GM_setValue('sost_cfg',JSON.stringify(c)); }
+  function saveCfg(c) { gmSet('sost_cfg', JSON.stringify(c)); }
   let cfg = loadCfg();
 
   // ─────────────────────────────────────────────────────────────
@@ -284,7 +299,7 @@
     .sost-res-copy { padding: 3px 9px !important; font-size: 12px !important; }
     #sost-results-empty { color: #475569; font-size: 12px; text-align: center; padding: 16px 0; }
   `;
-  document.head.appendChild(style);
+  (document.head || document.documentElement).appendChild(style);
 
   // ─────────────────────────────────────────────────────────────
   // FAB + panel
@@ -413,16 +428,17 @@
       </p>
     </div>
   `;
-  document.body.appendChild(panel);
+  (document.body || document.documentElement).appendChild(panel);
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
   document.getElementById('sost-close-btn').addEventListener('click', () => panel.classList.remove('open'));
-  document.querySelectorAll('.sost-tab').forEach(tab => {
+  panel.querySelectorAll('.sost-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      document.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
+      panel.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
+      panel.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
       tab.classList.add('active');
-      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      const pane = panel.querySelector('#tab-' + tab.dataset.tab);
+      if (pane) pane.classList.add('active');
     });
   });
 
@@ -1026,8 +1042,8 @@
   document.getElementById('sost-results-clear').addEventListener('click', () => { results=[]; renderResults(); });
 
   function switchTab(name) {
-    document.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-    document.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+name));
+    panel.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+    panel.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+name));
   }
 
   // ─────────────────────────────────────────────────────────────
