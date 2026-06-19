@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -63,7 +63,7 @@
     function tier(t) {
       if (!t) return '';
       t = t.toLowerCase().replace(/\s+/g,' ').trim();
-      return ({pm:' Pro Max','pro max':' Pro Max',pro:' Pro',plus:' Plus','+':('+'),' Plus',mini:' mini',fe:' FE',ultra:' Ultra'})[t]||' '+cap(t);
+      return ({pm:' Pro Max','pro max':' Pro Max',pro:' Pro',plus:' Plus','+':' Plus',mini:' mini',fe:' FE',ultra:' Ultra'})[t]||' '+cap(t);
     }
     function cap(s) { return s ? s[0].toUpperCase()+s.slice(1).toLowerCase() : ''; }
 
@@ -160,16 +160,16 @@
   const style = document.createElement('style');
   style.textContent = `
     #sost-fab {
-      position: fixed; bottom: 20px; left: 224px; width: 44px; height: 44px;
+      position: fixed; bottom: 20px; left: 20px; width: 44px; height: 44px;
       border-radius: 50%; background: #0d9488; box-shadow: 0 3px 14px rgba(13,148,136,.55);
-      border: none; cursor: pointer; z-index: 99999; display: flex; align-items: center;
+      border: none; cursor: pointer; z-index: 2147483647; display: flex; align-items: center;
       justify-content: center; font-size: 20px; transition: background .15s; user-select: none;
     }
     #sost-fab:hover { background: #0f766e; }
     #sost-panel {
       position: fixed; bottom: 72px; left: 20px; width: 420px; background: #0f172a;
       color: #e2e8f0; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.7);
-      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 99998;
+      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 2147483646;
       border: 1px solid #1e293b; display: none; overflow: hidden;
     }
     #sost-panel.open { display: block; }
@@ -275,7 +275,17 @@
   // ─────────────────────────────────────────────────────────────
   const fab = document.createElement('button');
   fab.id = 'sost-fab'; fab.title = 'SOS POS Sales Loader'; fab.innerHTML = '🏷️';
-  document.body.appendChild(fab);
+
+  function mountFab() {
+    if (document.body && !document.body.contains(fab)) document.body.appendChild(fab);
+  }
+  mountFab();
+
+  // Re-mount if the SPA ever removes the button on a re-render / route change
+  if (document.body) {
+    new MutationObserver(mountFab).observe(document.body, { childList: true });
+  }
+
   [400, 1200, 2500, 4500].forEach(t => setTimeout(positionFab, t));
   window.addEventListener('resize', () => setTimeout(positionFab, 100));
 
@@ -973,8 +983,10 @@
 
   // ─────────────────────────────────────────────────────────────
   // Position FAB next to app's own bottom-left buttons
+  // (falls back to a clear bottom-left corner if no anchor is found)
   // ─────────────────────────────────────────────────────────────
   function positionFab() {
+    mountFab(); // make sure it's still in the DOM before measuring
     let best=null, bestRight=-1;
     document.querySelectorAll('button,a,div,[role="button"]').forEach(el=>{
       if (el.id&&(el.id.startsWith('sost')||el.id.startsWith('sosw'))) return;
@@ -987,7 +999,7 @@
       if (r.right>bestRight) { bestRight=r.right; best=r; }
     });
     if (best&&bestRight<=400) { fab.style.left=Math.round(bestRight+12)+'px'; fab.style.bottom=Math.round(window.innerHeight-best.bottom)+'px'; }
-    else { fab.style.left='224px'; fab.style.bottom='20px'; }
+    else { fab.style.left='20px'; fab.style.bottom='20px'; }
   }
 
 })();
