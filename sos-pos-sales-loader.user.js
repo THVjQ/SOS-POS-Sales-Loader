@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.6
-// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Version badge reads a body constant so it works when loaded via the TM Script Manager.
+// @version      2.7
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Bounded-flex panel so tabs always render; single-instance guard.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -12,10 +12,15 @@
 (function () {
   'use strict';
 
+  // Guard: if a second copy loads (e.g. manager + a direct install both running),
+  // bail out so we don't get two panels with duplicate IDs breaking tab switching.
+  if (window.__sostSalesLoaded__) return;
+  window.__sostSalesLoaded__ = true;
+
   // Bump this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.6';
+  const SCRIPT_VERSION = '2.7';
 
   // ─────────────────────────────────────────────────────────────
   // Parser — device + repair job extractor (v2 improved algorithm)
@@ -234,11 +239,13 @@
       color: #e2e8f0; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.7);
       font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 99998;
       border: 1px solid #1e293b; display: none; overflow: hidden;
+      max-height: calc(100vh - 88px);
     }
-    #sost-panel.open { display: block; }
+    #sost-panel.open { display: flex; flex-direction: column; }
     #sost-header {
       background: linear-gradient(135deg,#14b8a6 0%,#0d9488 100%); padding: 14px 16px;
       font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px;
+      flex: 0 0 auto;
     }
     #sost-header .sost-title { flex: 1; }
     #sost-ver {
@@ -251,12 +258,12 @@
       align-items: center; justify-content: center;
     }
     #sost-close-btn:hover { background: rgba(255,255,255,.35); }
-    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; }
+    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; flex: 0 0 auto; }
     .sost-tab { flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 600;
       cursor: pointer; color: #64748b; border-bottom: 2px solid transparent; user-select: none; }
     .sost-tab.active { color: #14b8a6; border-bottom-color: #14b8a6; }
     .sost-pane { display: none; padding: 14px; }
-    .sost-pane.active { display: block; max-height: calc(100vh - 230px); overflow-y: auto; }
+    .sost-pane.active { display: block; flex: 1 1 auto; min-height: 60px; overflow-y: auto; }
     .sost-pane::-webkit-scrollbar { width: 6px; }
     .sost-pane::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .sost-field { margin-bottom: 10px; }
