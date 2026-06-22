@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry.
+// @version      2.2
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Panel now scrolls internally so Settings is always reachable.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -229,11 +229,13 @@
       color: #e2e8f0; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.7);
       font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 99998;
       border: 1px solid #1e293b; display: none; overflow: hidden;
+      max-height: calc(100dvh - 92px); flex-direction: column;
     }
-    #sost-panel.open { display: block; }
+    #sost-panel.open { display: flex; }
     #sost-header {
       background: linear-gradient(135deg,#14b8a6 0%,#0d9488 100%); padding: 14px 16px;
       font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px;
+      flex-shrink: 0;
     }
     #sost-header .sost-title { flex: 1; }
     #sost-close-btn {
@@ -242,12 +244,14 @@
       align-items: center; justify-content: center;
     }
     #sost-close-btn:hover { background: rgba(255,255,255,.35); }
-    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; }
+    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; flex-shrink: 0; }
     .sost-tab { flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 600;
       cursor: pointer; color: #64748b; border-bottom: 2px solid transparent; user-select: none; }
     .sost-tab.active { color: #14b8a6; border-bottom-color: #14b8a6; }
     .sost-pane { display: none; padding: 14px; }
-    .sost-pane.active { display: block; }
+    .sost-pane.active { display: block; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+    .sost-pane::-webkit-scrollbar { width: 6px; }
+    .sost-pane::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .sost-field { margin-bottom: 10px; }
     .sost-label { display: block; font-size: 11px; font-weight: 600; color: #64748b;
       margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
