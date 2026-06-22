@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Copy button outputs ticket numbers only.
+// @version      2.6
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Version badge reads a body constant so it works when loaded via the TM Script Manager.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -11,6 +11,11 @@
 
 (function () {
   'use strict';
+
+  // Bump this in lock-step with @version above. The TM Script Manager strips the
+  // UserScript header before eval, so @version isn't readable at runtime — this
+  // body constant is what the header badge shows.
+  const SCRIPT_VERSION = '2.6';
 
   // ─────────────────────────────────────────────────────────────
   // Parser — device + repair job extractor (v2 improved algorithm)
@@ -443,12 +448,11 @@
   `;
   document.body.appendChild(panel);
 
-  // Show the running version in the header badge (auto-read from @version)
+  // Show the running version in the header badge (from body constant — survives
+  // the manager's header-stripping, unlike GM_info / @version)
   (function () {
-    let v = '?';
-    try { v = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?'; } catch (e) {}
     const vEl = document.getElementById('sost-ver');
-    if (vEl) { vEl.textContent = 'v' + v; vEl.title = 'Script version ' + v; }
+    if (vEl) { vEl.textContent = 'v' + SCRIPT_VERSION; vEl.title = 'Sales Loader version ' + SCRIPT_VERSION; }
   })();
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
